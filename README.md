@@ -133,25 +133,39 @@ python3 verify_ghsa_c4j6.py --target ... --scan-paths-file my_paths.txt
 `--scan` probes a built-in list of common paths (Apache/nginx status modules,
 health & metrics endpoints, Spring Boot Actuator, Go pprof, Docker daemon
 endpoints, common admin panels, leaky config files, Elasticsearch routes,
-etc.) through the SSRF gadget. Output is grouped per target:
+etc.) through the SSRF gadget.
+
+By default, scan mode runs one extra **differential baseline** probe with
+a random non-existent path per target. Subsequent probes are tagged
+`DIFF` only when their `(status, body length)` signature diverges from
+the baseline — uniform 404s from a "found nothing" upstream are marked
+`noise` and don't inflate the hit count. Pass `--no-differential` to
+report every probe that reached a service (legacy behavior).
+
+Output is grouped per target:
 
 ```
-=== 10.0.0.5:443 ===
-  [VULN+] /                              impact=YES  status=200  ct='text/html'
-  [VULN+] /server-status                 impact=YES  status=403  ct='text/html'
-  [VULN+] /actuator/env                  impact=YES  status=200  ct='application/json'
-  [VULN+] /actuator/heapdump             impact=YES  status=200  ct='application/octet-stream'
-  [VULN+] /wp-admin/                     impact=YES  status=404  ct='text/html'
-  [ VULN] /.env                          impact= -
-  -> 5/6 paths reached a service
-  -> upstream server(s) seen: nginx/1.24.0
+=== vulnscope.local:3030 ===
+  baseline (random path): verdict=vulnerable_proxy_succeeded   status=404  bytes≈500
+  [VULN+] DIFF  /                              impact=YES  status=200  ct='text/html'
+  [VULN+] DIFF  /.env                          impact=YES  status=200  ct='application/octet-stream'
+  [VULN+] DIFF  /admin                         impact=YES  status=200  ct='application/octet-stream'
+  [VULN+] DIFF  /index.html                    impact=YES  status=200  ct='text/html'
+  [VULN+] DIFF  /server-status                 impact=YES  status=200  ct='application/octet-stream'
+  [VULN+] noise /_health                       impact=YES  status=404  ct='text/html;charset=utf-8'
+  [VULN+] noise /actuator/env                  impact=YES  status=404  ct='text/html;charset=utf-8'
+  ... (53 more 404 'noise' paths suppressed) ...
+  -> 5 differential hit(s) / 58 probes
+  -> upstream server(s) seen: SimpleHTTP/0.6 Python/3.14.4
 ```
 
-Hits (impact=YES) reveal what HTTP service is co-located on the target's
-localhost — that's where the actual exploitation primitives live (data read
-via GET, auth bypass via 127.0.0.1 allowlists, etc.). When every path
-returns `impact= -` (just `Internal Server Error`), the bug is present but
-nothing is listening on `localhost:80/443` of that host.
+`DIFF` rows are the real hits — paths whose response diverged from the
+random-path baseline (different status, different body length). `noise`
+rows reached an HTTP service too, but produced the same boring response
+as the baseline — typically uniform 404s the operator doesn't care
+about. When every probe is `noise` and there is no baseline divergence,
+the bug is still present but nothing useful is listening on
+`localhost:80/443` of that host.
 
 ### Flags
 
@@ -160,8 +174,9 @@ nothing is listening on `localhost:80/443` of that host.
 | `--target URL` | A single target. Repeat for multiple. | — |
 | `--targets-file PATH` | File with one target per line. | — |
 | `--probe-path PATH` | Path used in the crafted absolute URI. Reaches the target's localhost service at this path (logged on a per-target token suffix). | `/x` |
-| `--scan` | Enumerate common paths on each target's localhost service. | off |
+| `--scan` | Enumerate common paths on each target's localhost service. Sends one differential-baseline probe per target plus the path list. | off |
 | `--scan-paths-file PATH` | Custom path list for scan mode (one per line). Implies `--scan`. | built-in |
+| `--no-differential` | In `--scan` mode, skip the baseline probe and report every probe that reached a service (legacy behavior). | off |
 | `--timeout SEC` | Per-socket timeout. | `5` |
 | `--concurrency N` | Parallel probes. | `10` |
 | `--insecure` | Skip TLS certificate verification. Required with `--proxy` when MITM'ing TLS. | off |

@@ -303,15 +303,44 @@ async def probe_one(
             pass
 
 
-async def run(targets, paths, concurrency, timeout, verify_tls, proxy_info=None):
+def _response_signature(result: dict) -> tuple:
+    """Signature used for differential filtering: (status, body length)."""
+    if result.get("status") != "sent":
+        return ("error", result.get("verdict"))
+    snippet = result.get("response_snippet") or ""
+    return (result.get("upstream_status"), len(snippet))
+
+
+async def run(targets, paths, concurrency, timeout, verify_tls,
+              proxy_info=None, differential=False):
+    """Run probes. When `differential` is True, an extra random-path probe
+    is sent per target first; subsequent probes get a `differential` field
+    indicating whether their response diverges from that baseline."""
     sem = asyncio.Semaphore(concurrency)
 
     async def bound(t, p):
         async with sem:
             return await probe_one(t, p, timeout, verify_tls, proxy_info)
 
-    tasks = [bound(t, p) for t in targets for p in paths]
-    return await asyncio.gather(*tasks)
+    if not differential:
+        tasks = [bound(t, p) for t in targets for p in paths]
+        return await asyncio.gather(*tasks)
+
+    # Differential mode: one baseline per target, then the scan paths.
+    out: list[dict] = []
+    for target in targets:
+        baseline_path = "/" + secrets.token_hex(8) + "-nonexistent"
+        baseline = await bound(target, baseline_path)
+        baseline["is_baseline"] = True
+        baseline_sig = _response_signature(baseline)
+        out.append(baseline)
+
+        scan_tasks = [bound(target, p) for p in paths]
+        scan_results = await asyncio.gather(*scan_tasks)
+        for r in scan_results:
+            r["differential"] = (_response_signature(r) != baseline_sig)
+        out.extend(scan_results)
+    return out
 
 
 def load_targets(args) -> list[str]:
@@ -367,6 +396,10 @@ def main() -> int:
     p.add_argument("--scan-paths-file",
                    help="File with paths (one per line, '#' for comments) to "
                         "use instead of the built-in scan list. Implies --scan.")
+    p.add_argument("--no-differential", action="store_true",
+                   help="In --scan mode, disable the baseline differential "
+                        "filter (report every probe that reached a service, "
+                        "even uniform 404s). On by default in --scan.")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     p.add_argument("--insecure", action="store_true",
@@ -403,9 +436,10 @@ def main() -> int:
         except ValueError as e:
             p.error(str(e))
 
+    differential = scan_mode and not args.no_differential
     results = asyncio.run(
         run(targets, paths, args.concurrency, args.timeout,
-            not args.insecure, proxy_info)
+            not args.insecure, proxy_info, differential=differential)
     )
 
     if args.json:
@@ -461,17 +495,43 @@ def _print_scan(results: list[dict]) -> None:
 
     for target, rows in by_target.items():
         print(f"\n=== {target} ===")
-        # detection summary: vulnerable if ANY row says so
-        any_vuln = any(r["verdict"].startswith("vulnerable") for r in rows)
-        any_impact = any(r.get("impact_confirmed") for r in rows)
+        baseline = next((r for r in rows if r.get("is_baseline")), None)
+        scan_rows = [r for r in rows if not r.get("is_baseline")]
+        any_vuln = any(r["verdict"].startswith("vulnerable") for r in scan_rows)
+        any_impact = any(r.get("impact_confirmed") for r in scan_rows)
+        diff_mode = baseline is not None
+
         if not any_vuln:
             print("  (not vulnerable / no signal — skipping detail)")
             continue
-        for r in rows:
+
+        if diff_mode:
+            b_status = baseline.get("upstream_status", "-")
+            b_len = len(baseline.get("response_snippet") or "")
+            print(f"  baseline (random path): verdict={baseline['verdict']:<28}"
+                  f" status={b_status}  bytes≈{b_len}")
+
+        # Sort: DIFF hits first, then path order
+        def _sort_key(r):
+            return (
+                not r.get("differential", True),   # diffs first when diff_mode
+                not r.get("impact_confirmed"),
+                r.get("probe_path", ""),
+            )
+        for r in sorted(scan_rows, key=_sort_key):
             tag = VERDICT_GLYPH.get(r["verdict"], r["verdict"])
             impact = "YES" if r.get("impact_confirmed") else " - "
             path = r.get("probe_path", "?")
-            line = f"  [{tag:>5}] {path:<30} impact={impact}"
+            if diff_mode:
+                if r.get("differential") and r.get("impact_confirmed"):
+                    marker = "DIFF "
+                elif r.get("impact_confirmed"):
+                    marker = "noise"
+                else:
+                    marker = "     "
+            else:
+                marker = ""
+            line = f"  [{tag:>5}] {marker} {path:<30} impact={impact}"
             if r.get("upstream_status"):
                 line += f"  status={r['upstream_status']}"
             if r.get("upstream_content_type"):
@@ -480,14 +540,23 @@ def _print_scan(results: list[dict]) -> None:
                 line += f"  err={r['error']}"
             print(line)
 
-        if any_impact:
-            servers = {r.get("upstream_server")
-                       for r in rows if r.get("upstream_server")}
-            servers.discard(None)
-            hits = [r for r in rows if r.get("impact_confirmed")]
-            print(f"  -> {len(hits)}/{len(rows)} paths reached a service")
+        servers = {r.get("upstream_server")
+                   for r in scan_rows if r.get("upstream_server")}
+        servers.discard(None)
+        if diff_mode:
+            diff_hits = [r for r in scan_rows
+                         if r.get("differential") and r.get("impact_confirmed")]
+            print(f"  -> {len(diff_hits)} differential hit(s) / "
+                  f"{len(scan_rows)} probes")
             if servers:
-                print(f"  -> upstream server(s) seen: {', '.join(sorted(s for s in servers if s))}")
+                print(f"  -> upstream server(s) seen: "
+                      f"{', '.join(sorted(s for s in servers if s))}")
+        elif any_impact:
+            hits = [r for r in scan_rows if r.get("impact_confirmed")]
+            print(f"  -> {len(hits)}/{len(scan_rows)} paths reached a service")
+            if servers:
+                print(f"  -> upstream server(s) seen: "
+                      f"{', '.join(sorted(s for s in servers if s))}")
         else:
             print("  -> bug present but nothing answering on localhost:80/443")
 
