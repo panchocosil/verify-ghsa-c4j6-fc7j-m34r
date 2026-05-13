@@ -228,9 +228,14 @@ async def probe_one(
                 "impact_confirmed": False, "error": str(e)}
 
     host_header = host if port in (80, 443) else f"{host}:{port}"
-    # absolute-form request-URI; the path includes the token so log inspection
-    # on a co-located localhost service can correlate the probe to its target
-    absolute_uri = f"http://canary.invalid{probe_path}/{token}"
+    # Use an empty-authority absolute URI ("http:///<path>"). After Next's
+    # normalizeRepeatedSlashes collapses the //, the parsed URL becomes
+    # "http:/<path>"; http-proxy then dials localhost:80 with the request
+    # path = "/<path>" verbatim — which is what we actually want to probe.
+    # An earlier "http://canary.invalid/<path>" form caused every probe to
+    # hit "/canary.invalid/<path>" on the target's localhost service,
+    # producing only false-positive 404s.
+    absolute_uri = "http:///" + probe_path.lstrip("/")
     payload = build_payload(absolute_uri, host_header)
 
     ssl_ctx: ssl.SSLContext | None = None
