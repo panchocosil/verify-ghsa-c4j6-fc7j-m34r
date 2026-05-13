@@ -120,7 +120,38 @@ cat targets.txt | python3 verify_ghsa_c4j6.py
 
 # JSON Lines output for downstream tooling
 python3 verify_ghsa_c4j6.py --targets-file targets.txt --json
+
+# Enumerate co-located services on the target's localhost:80/443 via the bug
+python3 verify_ghsa_c4j6.py --target https://app.example.com --scan
+
+# Same, with a custom path list
+python3 verify_ghsa_c4j6.py --target ... --scan-paths-file my_paths.txt
 ```
+
+### Scan mode
+
+`--scan` probes a built-in list of common paths (Apache/nginx status modules,
+health & metrics endpoints, Spring Boot Actuator, Go pprof, Docker daemon
+endpoints, common admin panels, leaky config files, Elasticsearch routes,
+etc.) through the SSRF gadget. Output is grouped per target:
+
+```
+=== 10.0.0.5:443 ===
+  [VULN+] /                              impact=YES  status=200  ct='text/html'
+  [VULN+] /server-status                 impact=YES  status=403  ct='text/html'
+  [VULN+] /actuator/env                  impact=YES  status=200  ct='application/json'
+  [VULN+] /actuator/heapdump             impact=YES  status=200  ct='application/octet-stream'
+  [VULN+] /wp-admin/                     impact=YES  status=404  ct='text/html'
+  [ VULN] /.env                          impact= -
+  -> 5/6 paths reached a service
+  -> upstream server(s) seen: nginx/1.24.0
+```
+
+Hits (impact=YES) reveal what HTTP service is co-located on the target's
+localhost — that's where the actual exploitation primitives live (data read
+via GET, auth bypass via 127.0.0.1 allowlists, etc.). When every path
+returns `impact= -` (just `Internal Server Error`), the bug is present but
+nothing is listening on `localhost:80/443` of that host.
 
 ### Flags
 
@@ -129,6 +160,8 @@ python3 verify_ghsa_c4j6.py --targets-file targets.txt --json
 | `--target URL` | A single target. Repeat for multiple. | — |
 | `--targets-file PATH` | File with one target per line. | — |
 | `--probe-path PATH` | Path used in the crafted absolute URI. Reaches the target's localhost service at this path (logged on a per-target token suffix). | `/x` |
+| `--scan` | Enumerate common paths on each target's localhost service. | off |
+| `--scan-paths-file PATH` | Custom path list for scan mode (one per line). Implies `--scan`. | built-in |
 | `--timeout SEC` | Per-socket timeout. | `5` |
 | `--concurrency N` | Parallel probes. | `10` |
 | `--insecure` | Skip TLS certificate verification. | off |

