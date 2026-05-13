@@ -89,11 +89,30 @@ crafted upgrade, reads the response, and produces two signals:
 | Contains `Internal Server Error` | `vulnerable` | `false` — bug proven, but proxy hit nothing on localhost |
 | Starts with `HTTP/1.` | `vulnerable_proxy_succeeded` | `true` — real response data exfiltrated |
 | Empty / clean close | `likely_patched` | `false` — also covers "not Next", "reverse proxy stripped Upgrade", "Vercel" |
+| Identical to no-Upgrade control | `front_end_intercepts` | `false` — front-end proxy short-circuited both probes; SSRF never reached Next |
 | Anything else | `inconclusive` | `false` |
 
 When `impact_confirmed` is true the JSON output also includes
 `upstream_status`, `upstream_server` and `upstream_content_type` parsed
 from the leaked response (useful for triage / report-writing).
+
+### Front-end proxy false-positive guard
+
+By default, every target also receives a **control probe** with the same
+absolute-URI request line but no Upgrade headers (`Connection: close`).
+If the front-end returns the same response to both probes (status line +
+size within tolerance), the host's own front-end is rejecting the
+absolute-URI request line itself — nginx 400, Apache 400, CDN edge — and
+the SSRF never reached Next. The verdict downgrades to
+`front_end_intercepts` and the JSON output includes `front_end_status`
+and `front_end_server` parsed from the proxy's response so the operator
+can identify what is intercepting.
+
+This eliminates a real-world false positive observed when self-hosted
+Next sits behind nginx/Apache: those proxies reject the probe's
+`GET http:///x HTTP/1.1` request line with a generic 400, which the
+detector previously misread as `vulnerable_proxy_succeeded`. Pass
+`--no-control-probe` to opt out and see the raw verdicts.
 
 ## Requirements
 
@@ -177,6 +196,7 @@ the bug is still present but nothing useful is listening on
 | `--scan` | Enumerate common paths on each target's localhost service. Sends one differential-baseline probe per target plus the path list. | off |
 | `--scan-paths-file PATH` | Custom path list for scan mode (one per line). Implies `--scan`. | built-in |
 | `--no-differential` | In `--scan` mode, skip the baseline probe and report every probe that reached a service (legacy behavior). | off |
+| `--no-control-probe` | Disable the front-end short-circuit guard (extra no-Upgrade probe per target). Useful when targets are strictly known to be direct Next processes. | off |
 | `--timeout SEC` | Per-socket timeout. | `5` |
 | `--concurrency N` | Parallel probes. | `10` |
 | `--insecure` | Skip TLS certificate verification. Required with `--proxy` when MITM'ing TLS. | off |

