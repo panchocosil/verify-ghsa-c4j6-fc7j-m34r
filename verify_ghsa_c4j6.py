@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import re
 import secrets
@@ -122,6 +123,68 @@ def parse_target(url: str) -> tuple[str, int, bool]:
     return host, port, is_tls
 
 
+def parse_proxy(url: str) -> tuple[str, int, str | None, str | None]:
+    """Return (host, port, username, password) for an http(s):// CONNECT proxy."""
+    if "://" not in url:
+        url = "http://" + url
+    p = urlsplit(url)
+    if p.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported proxy scheme: {p.scheme}")
+    if not p.hostname:
+        raise ValueError(f"invalid proxy URL: {url}")
+    port = p.port or (443 if p.scheme == "https" else 8080)
+    return p.hostname, port, p.username, p.password
+
+
+async def _open_via_proxy(
+    target_host: str,
+    target_port: int,
+    ssl_ctx: ssl.SSLContext | None,
+    proxy_info: tuple[str, int, str | None, str | None],
+    timeout: float,
+):
+    """Open a (possibly TLS) connection through an HTTP CONNECT proxy."""
+    p_host, p_port, p_user, p_pass = proxy_info
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(p_host, p_port), timeout=timeout
+    )
+
+    lines = [
+        f"CONNECT {target_host}:{target_port} HTTP/1.1",
+        f"Host: {target_host}:{target_port}",
+    ]
+    if p_user is not None:
+        creds = f"{p_user}:{p_pass or ''}".encode("latin-1")
+        token = base64.b64encode(creds).decode("ascii")
+        lines.append(f"Proxy-Authorization: Basic {token}")
+    lines.extend(["", ""])
+    writer.write("\r\n".join(lines).encode("latin-1"))
+    await writer.drain()
+
+    status = await asyncio.wait_for(reader.readline(), timeout=timeout)
+    if not status:
+        writer.close()
+        raise OSError("proxy closed before CONNECT response")
+    parts = status.decode("latin-1", "replace").split(" ", 2)
+    if len(parts) < 2 or not parts[1].startswith("2"):
+        writer.close()
+        raise OSError(f"CONNECT failed: {status.decode('latin-1','replace').strip()}")
+
+    while True:
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        if line in (b"\r\n", b""):
+            break
+
+    if ssl_ctx is not None:
+        if not hasattr(writer, "start_tls"):
+            raise RuntimeError(
+                "TLS over CONNECT proxy requires Python 3.11+"
+            )
+        await writer.start_tls(ssl_ctx, server_hostname=target_host)
+
+    return reader, writer
+
+
 def classify(snippet: str) -> tuple[str, bool, dict]:
     """Map the raw bytes of the socket reply to (verdict, impact_confirmed, extras).
 
@@ -154,6 +217,7 @@ async def probe_one(
     probe_path: str,
     timeout: float,
     verify_tls: bool,
+    proxy_info: tuple | None = None,
 ) -> dict:
     token = secrets.token_hex(8)
     try:
@@ -169,21 +233,28 @@ async def probe_one(
     absolute_uri = f"http://canary.invalid{probe_path}/{token}"
     payload = build_payload(absolute_uri, host_header)
 
+    ssl_ctx: ssl.SSLContext | None = None
+    if is_tls:
+        ssl_ctx = ssl.create_default_context()
+        if not verify_tls:
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
     try:
-        if is_tls:
-            ctx = ssl.create_default_context()
-            if not verify_tls:
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+        if proxy_info is not None:
+            reader, writer = await _open_via_proxy(
+                host, port, ssl_ctx, proxy_info, timeout
+            )
+        elif ssl_ctx is not None:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, ssl=ctx, server_hostname=host),
+                asyncio.open_connection(host, port, ssl=ssl_ctx, server_hostname=host),
                 timeout=timeout,
             )
         else:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=timeout
             )
-    except (asyncio.TimeoutError, OSError, ssl.SSLError) as e:
+    except (asyncio.TimeoutError, OSError, ssl.SSLError, RuntimeError) as e:
         return {"target": target, "probe_path": probe_path, "token": token,
                 "status": "connect_error", "verdict": "error",
                 "impact_confirmed": False, "error": str(e)}
@@ -227,12 +298,12 @@ async def probe_one(
             pass
 
 
-async def run(targets, paths, concurrency, timeout, verify_tls):
+async def run(targets, paths, concurrency, timeout, verify_tls, proxy_info=None):
     sem = asyncio.Semaphore(concurrency)
 
     async def bound(t, p):
         async with sem:
-            return await probe_one(t, p, timeout, verify_tls)
+            return await probe_one(t, p, timeout, verify_tls, proxy_info)
 
     tasks = [bound(t, p) for t in targets for p in paths]
     return await asyncio.gather(*tasks)
@@ -294,7 +365,12 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     p.add_argument("--insecure", action="store_true",
-                   help="Skip TLS certificate verification for https targets.")
+                   help="Skip TLS certificate verification for https targets. "
+                        "Required when --proxy MITMs TLS (e.g. Burp).")
+    p.add_argument("--proxy",
+                   help="HTTP CONNECT proxy to tunnel through, e.g. "
+                        "http://127.0.0.1:8080 or http://user:pass@host:port "
+                        "(Burp, mitmproxy, OWASP ZAP).")
     p.add_argument("--json", action="store_true",
                    help="Emit JSON Lines instead of human-readable output.")
     args = p.parse_args()
@@ -315,8 +391,16 @@ def main() -> int:
         paths = [args.probe_path]
         scan_mode = False
 
+    proxy_info = None
+    if args.proxy:
+        try:
+            proxy_info = parse_proxy(args.proxy)
+        except ValueError as e:
+            p.error(str(e))
+
     results = asyncio.run(
-        run(targets, paths, args.concurrency, args.timeout, not args.insecure)
+        run(targets, paths, args.concurrency, args.timeout,
+            not args.insecure, proxy_info)
     )
 
     if args.json:

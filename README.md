@@ -164,10 +164,30 @@ nothing is listening on `localhost:80/443` of that host.
 | `--scan-paths-file PATH` | Custom path list for scan mode (one per line). Implies `--scan`. | built-in |
 | `--timeout SEC` | Per-socket timeout. | `5` |
 | `--concurrency N` | Parallel probes. | `10` |
-| `--insecure` | Skip TLS certificate verification. | off |
+| `--insecure` | Skip TLS certificate verification. Required with `--proxy` when MITM'ing TLS. | off |
+| `--proxy URL` | Tunnel through an HTTP CONNECT proxy (Burp / mitmproxy / ZAP). Supports basic auth via `http://user:pass@host:port`. Requires Python 3.11+ for TLS targets. | direct |
 | `--json` | Emit JSON Lines instead of human text. | off |
 
 Targets may be `host`, `host:port`, or full `http(s)://...` URLs.
+
+### Proxy support
+
+Tunnel all probes through an HTTP CONNECT proxy for inspection in Burp /
+mitmproxy / OWASP ZAP:
+
+```bash
+# plain HTTP target via Burp
+python3 verify_ghsa_c4j6.py --target http://app.example.com --proxy http://127.0.0.1:8080
+
+# HTTPS target via Burp (Burp MITMs TLS — need --insecure or install Burp CA)
+python3 verify_ghsa_c4j6.py --target https://app.example.com --proxy http://127.0.0.1:8080 --insecure
+
+# proxy with basic auth
+python3 verify_ghsa_c4j6.py --target ... --proxy http://user:pass@10.0.0.1:3128
+```
+
+The proxy sees a `CONNECT host:port` followed by the raw upgrade payload —
+useful when you want Burp to log/replay/modify the SSRF probes.
 
 ## Reproducing locally
 
