@@ -76,15 +76,24 @@ reachable because the bug pins the destination to localhost.
 
 ## Detection model
 
-For each target, the script opens a raw TCP (or TLS) socket and sends the
-crafted upgrade. It then reads the response and classifies:
+For each target, the script opens a raw TCP (or TLS) socket, sends the
+crafted upgrade, reads the response, and produces two signals:
 
-| Response | Verdict |
-|---|---|
-| Contains `Internal Server Error` | **`vulnerable`** — Next's `http-proxy` error handler ran, which only the pre-patch path reaches. |
-| Starts with `HTTP/1.` | **`vulnerable_proxy_succeeded`** — a service on the target's localhost actually answered the proxied upgrade. |
-| Empty / clean close | **`likely_patched`** — also covers "not Next", "reverse proxy stripped the Upgrade", "Vercel". |
-| Anything else | **`inconclusive`**. |
+- **`verdict`** — whether the bug is present.
+- **`impact_confirmed`** — whether the SSRF actually exfiltrated data
+  (i.e. a co-located service on `localhost:80/443` of the target answered
+  and we got its response back).
+
+| Response | Verdict | `impact_confirmed` |
+|---|---|---|
+| Contains `Internal Server Error` | `vulnerable` | `false` — bug proven, but proxy hit nothing on localhost |
+| Starts with `HTTP/1.` | `vulnerable_proxy_succeeded` | `true` — real response data exfiltrated |
+| Empty / clean close | `likely_patched` | `false` — also covers "not Next", "reverse proxy stripped Upgrade", "Vercel" |
+| Anything else | `inconclusive` | `false` |
+
+When `impact_confirmed` is true the JSON output also includes
+`upstream_status`, `upstream_server` and `upstream_content_type` parsed
+from the leaked response (useful for triage / report-writing).
 
 ## Requirements
 
@@ -142,10 +151,24 @@ python3 ../verify_ghsa_c4j6.py --target 127.0.0.1:3030
 Output:
 
 ```
-[ VULN] target=127.0.0.1:3030  verdict=vulnerable  snippet='Internal Server Error'
+[ VULN] target=127.0.0.1:3030  verdict=vulnerable  impact= no
+        snippet: 'Internal Server Error'
 ```
 
 Repeat with `next@15.5.16` and you should see `verdict=likely_patched`.
+
+### Impact demo (real data exfiltration)
+
+`demo_impact.sh` runs Next on `:80` (so its localhost-pinned SSRF target
+*is* the same Next process) and reads Next's own HTML back through the
+bug. Requires `sudo` for the privileged port bind.
+
+```bash
+LAB_DIR=/path/to/next-vuln-lab ./demo_impact.sh
+```
+
+Expected output ends with `IMPACT CONFIRMED — SSRF reached a service on
+the target localhost and read response data back`.
 
 ## Caveats
 

